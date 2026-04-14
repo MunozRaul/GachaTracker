@@ -3,7 +3,7 @@ mod offline_adapter_sdk;
 use offline_adapter_sdk::{FunctionOfflineAdapter, OfflineAdapterRegistry};
 use regex::Regex;
 use reqwest::blocking::Client;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -217,7 +217,7 @@ const CONFIRMED_OFFICIAL_API_HOSTS: [&str; 8] = [
     "public-operation-nap.hoyoverse.com",
     "public-operation-nap-sg.hoyoverse.com",
 ];
-const DB_SCHEMA_VERSION: i64 = 4;
+const DB_SCHEMA_VERSION: i64 = 5;
 const WUWA_ROOT_DIR_HINTS: [&str; 4] = [
     "WutheringWaves",
     "Wuthering Waves",
@@ -542,6 +542,27 @@ fn get_recent_scans(app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<Sca
         out.push(row.map_err(|e| format!("Failed reading scan row: {e}"))?);
     }
     Ok(out)
+}
+
+#[tauri::command]
+fn get_latest_import_session(app: tauri::AppHandle) -> Result<Option<ImportSession>, String> {
+    let db_path = database_path(&app)?;
+    let conn = open_db(&db_path)?;
+    let latest_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM import_sessions ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed querying latest import session: {e}"))?;
+
+    if let Some(scan_id) = latest_id {
+        let session = load_import_session(&conn, scan_id)?;
+        Ok(Some(session))
+    } else {
+        Ok(None)
+    }
 }
 
 fn source_type_from_path(path: &str) -> &'static str {
@@ -1012,9 +1033,12 @@ fn query_map_from_token_url(token_url: &str) -> Option<BTreeMap<String, String>>
 
 fn history_timeout_client() -> Result<Client, String> {
     Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(4))
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("GachaTrackerDesktop/0.1.0")
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(25))
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
         .build()
         .map_err(|e| format!("Failed creating HTTP client: {e}"))
 }
@@ -1047,12 +1071,17 @@ fn fetch_wuwa_history_from_token(
         .get("resources_id")
         .cloned()
         .ok_or_else(|| "WuWa token missing resources_id.".to_string())?;
+    let server_area = query
+        .get("svr_area")
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     let host = Url::parse(token_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
-    let api_base = if host.contains(".aki-game.net") {
+    let api_base = if server_area == "global" || host.contains(".aki-game.net") {
         "https://gmserver-api.aki-game2.net"
     } else {
         "https://gmserver-api.aki-game2.com"
@@ -1061,6 +1090,7 @@ fn fetch_wuwa_history_from_token(
     policy.assert_url_allowed(&api_url)?;
 
     let mut rows = Vec::<HistoryPullRow>::new();
+    let mut pool_errors = Vec::<String>::new();
     for card_pool_type in 1..=7 {
         let payload = serde_json::json!({
             "serverId": server_id,
@@ -1079,43 +1109,82 @@ fn fetch_wuwa_history_from_token(
         let response_json: Value = response
             .json()
             .map_err(|e| format!("WuWa history response parse failed: {e}"))?;
+        let code = response_json
+            .get("code")
+            .or_else(|| response_json.get("Code"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if code != 0 {
+            let message = response_json
+                .get("message")
+                .or_else(|| response_json.get("Message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            pool_errors.push(format!(
+                "cardPoolType={card_pool_type} returned code={code} message={message}"
+            ));
+            continue;
+        }
 
         let list = if let Some(array) = response_json.as_array() {
             array.to_vec()
         } else if let Some(array) = response_json.get("data").and_then(Value::as_array) {
             array.to_vec()
+        } else if let Some(array) = response_json.get("Data").and_then(Value::as_array) {
+            array.to_vec()
+        } else if let Some(array) = response_json
+            .get("data")
+            .and_then(|v| v.get("list"))
+            .and_then(Value::as_array)
+        {
+            array.to_vec()
+        } else if let Some(array) = response_json
+            .get("Data")
+            .and_then(|v| v.get("List"))
+            .and_then(Value::as_array)
+        {
+            array.to_vec()
         } else if let Some(array) = response_json.get("result").and_then(Value::as_array) {
             array.to_vec()
+        } else if let Some(array) = response_json.get("Result").and_then(Value::as_array) {
+            array.to_vec()
         } else {
-            Vec::new()
+            find_wuwa_items_array(&response_json).unwrap_or_default()
         };
 
         for entry in list {
             let item_name = entry
                 .get("name")
+                .or_else(|| entry.get("Name"))
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown")
                 .to_string();
             let item_type_name = entry
                 .get("resourceType")
+                .or_else(|| entry.get("ResourceType"))
                 .or_else(|| entry.get("itemType"))
+                .or_else(|| entry.get("ItemType"))
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown")
                 .to_string();
             let rarity = entry
                 .get("qualityLevel")
+                .or_else(|| entry.get("QualityLevel"))
                 .or_else(|| entry.get("rankType"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
             let pulled_at = entry
                 .get("time")
+                .or_else(|| entry.get("Time"))
                 .or_else(|| entry.get("createTime"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let pull_id = entry
                 .get("resourceId")
+                .or_else(|| entry.get("ResourceId"))
                 .or_else(|| entry.get("id"))
+                .or_else(|| entry.get("Id"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .unwrap_or_else(|| format!("{item_name}:{pulled_at}:{card_pool_type}"));
@@ -1134,7 +1203,38 @@ fn fetch_wuwa_history_from_token(
         }
     }
 
+    if rows.is_empty() && !pool_errors.is_empty() {
+        return Err(format!(
+            "WuWa API returned no history rows. {}",
+            pool_errors.join(" | ")
+        ));
+    }
     Ok(rows)
+}
+
+fn find_wuwa_items_array(value: &Value) -> Option<Vec<Value>> {
+    if let Some(array) = value.as_array() {
+        let looks_like_item_list = array.iter().any(|entry| {
+            entry.get("name").is_some()
+                || entry.get("Name").is_some()
+                || entry.get("qualityLevel").is_some()
+                || entry.get("QualityLevel").is_some()
+                || entry.get("resourceType").is_some()
+                || entry.get("ResourceType").is_some()
+        });
+        if looks_like_item_list {
+            return Some(array.to_vec());
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        for nested in object.values() {
+            if let Some(found) = find_wuwa_items_array(nested) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn fetch_hoyo_history_from_token(
@@ -1272,12 +1372,13 @@ fn fetch_history_pulls_from_tokens(
     let mut errors = Vec::<String>::new();
     let mut attempts_by_game = BTreeMap::<String, usize>::new();
 
-    for finding in findings {
+    let max_attempts_per_game = 3usize;
+    for finding in findings.iter().rev() {
         if finding.kind != "url_token" {
             continue;
         }
         let attempts = attempts_by_game.entry(finding.game_id.clone()).or_insert(0);
-        if *attempts >= 2 {
+        if *attempts >= max_attempts_per_game {
             continue;
         }
         let token_url = finding.raw_value.as_deref().unwrap_or(&finding.value);
@@ -1287,7 +1388,7 @@ fn fetch_history_pulls_from_tokens(
             match fetch_wuwa_history_from_token(token_url, policy, &client) {
                 Ok(fetched) => {
                     rows.extend(fetched);
-                    *attempts = 2;
+                    *attempts = max_attempts_per_game;
                 }
                 Err(err) => errors.push(format!("wuthering-waves: {err}")),
             }
@@ -1300,7 +1401,7 @@ fn fetch_history_pulls_from_tokens(
             match fetch_hoyo_history_from_token(&finding.game_id, token_url, policy, &client) {
                 Ok(fetched) => {
                     rows.extend(fetched);
-                    *attempts = 2;
+                    *attempts = max_attempts_per_game;
                 }
                 Err(err) => errors.push(format!("{}: {err}", finding.game_id)),
             }
@@ -1308,7 +1409,16 @@ fn fetch_history_pulls_from_tokens(
     }
 
     if rows.is_empty() && !errors.is_empty() {
-        return Err(errors.join(" | "));
+        errors.sort();
+        errors.dedup();
+        let preview = errors.iter().take(4).cloned().collect::<Vec<_>>();
+        let remainder = errors.len().saturating_sub(preview.len());
+        let suffix = if remainder > 0 {
+            format!(" | ... ({remainder} more)")
+        } else {
+            String::new()
+        };
+        return Err(format!("{}{}", preview.join(" | "), suffix));
     }
     dedup_history_pulls(&mut rows);
     Ok(rows)
@@ -1619,20 +1729,29 @@ fn scan_wuwa(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> 
             }
         }
     }
-    let files = collect_existing_files(log_candidates);
+    let mut files = collect_existing_files(log_candidates);
+    files.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|dur| dur.as_secs())
+            .unwrap_or(0)
+    });
 
     let pattern = Regex::new(r#"https?://[^\s"']*aki/gacha/index\.html#/record[^\s"']*"#)
         .map_err(|e| format!("Regex build failed for WuWa parser: {e}"))?;
 
     for log_file in &files {
         let text = read_text(log_file)?;
-        for hit in pattern.find_iter(&text) {
+        if let Some(hit) = pattern.find_iter(&text).last() {
+            let normalized = normalize_logged_url(hit.as_str());
             findings.push(ScanFinding {
                 game_id: game_id.clone(),
                 source_file: log_file.display().to_string(),
                 kind: "url_token".to_string(),
-                value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
-                raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
+                value: sanitize_url(&normalized),
+                raw_value: Some(normalized),
             });
         }
     }
@@ -1764,12 +1883,13 @@ fn scan_zzz(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> {
         let text = read_text(log)?;
 
         for hit in zzz_gacha_url_pattern.find_iter(&text) {
+            let normalized = normalize_logged_url(hit.as_str());
             findings.push(ScanFinding {
                 game_id: game_id.clone(),
                 source_file: log.display().to_string(),
                 kind: "url_token".to_string(),
-                value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
-                raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
+                value: sanitize_url(&normalized),
+                raw_value: Some(normalized),
             });
         }
         findings.extend(extract_gacha_log_findings(&text, &game_id, log)?);
@@ -1854,7 +1974,7 @@ fn scan_endfield(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), Stri
         findings.extend(extract_gacha_log_findings(&text, &game_id, log)?);
 
         for hit in generic_pattern.find_iter(&text) {
-            let candidate = trim_trailing_delimiters(hit.as_str());
+            let candidate = normalize_logged_url(hit.as_str());
             if candidate.contains("gacha")
                 || candidate.contains("wish")
                 || candidate.contains("pool")
@@ -1864,8 +1984,8 @@ fn scan_endfield(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), Stri
                     game_id: game_id.clone(),
                     source_file: log.display().to_string(),
                     kind: "possible_history_source".to_string(),
-                    value: sanitize_url(candidate),
-                    raw_value: Some(candidate.to_string()),
+                    value: sanitize_url(&candidate),
+                    raw_value: Some(candidate),
                 });
             }
         }
@@ -2149,12 +2269,13 @@ fn extract_gacha_log_findings(
         .map_err(|e| format!("Regex build failed for cache parser: {e}"))?;
 
     for hit in pattern.find_iter(text) {
+        let normalized = normalize_logged_url(hit.as_str());
         findings.push(ScanFinding {
             game_id: game_id.to_string(),
             source_file: source.display().to_string(),
             kind: "url_token".to_string(),
-            value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
-            raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
+            value: sanitize_url(&normalized),
+            raw_value: Some(normalized),
         });
     }
     Ok(findings)
@@ -2187,6 +2308,18 @@ fn find_data2_files(search_root: &Path) -> Vec<PathBuf> {
 
 fn trim_trailing_delimiters(value: &str) -> &str {
     value.trim_end_matches(|c: char| c == ',' || c == ']' || c == ')' || c == '"')
+}
+
+fn normalize_logged_url(value: &str) -> String {
+    trim_trailing_delimiters(value)
+        .trim()
+        .trim_matches('"')
+        .replace("\\u0026", "&")
+        .replace("\\u003d", "=")
+        .replace("\\u003f", "?")
+        .replace("\\u002F", "/")
+        .replace("\\/", "/")
+        .replace("&amp;", "&")
 }
 
 fn sanitize_url(url: &str) -> String {
@@ -2432,6 +2565,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
                 item_type_name TEXT NULL,
                 rarity INTEGER NULL,
                 pulled_at TEXT NULL,
+                row_index INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(scan_id, id),
                 FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE
             );
@@ -2517,6 +2651,26 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         current_version = 4;
         tx.pragma_update(None, "user_version", current_version)
             .map_err(|e| format!("Failed updating schema version to v4: {e}"))?;
+    }
+
+    if current_version < 5 {
+        tx.execute_batch(
+            "
+            ALTER TABLE import_pulls ADD COLUMN row_index INTEGER NOT NULL DEFAULT 0;
+            ",
+        )
+        .or_else(|_| Ok(()))
+        .map_err(|e: rusqlite::Error| format!("Failed applying schema migration v5: {e}"))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![5i64, unix_ts() as i64],
+        )
+        .map_err(|e| format!("Failed recording migration v5: {e}"))?;
+
+        current_version = 5;
+        tx.pragma_update(None, "user_version", current_version)
+            .map_err(|e| format!("Failed updating schema version to v5: {e}"))?;
     }
 
     if current_version > DB_SCHEMA_VERSION {
@@ -2728,14 +2882,15 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
     )
     .map_err(|e| format!("Failed clearing existing import diagnostics: {e}"))?;
 
-    let mut stable_pulls = session.pulls.clone();
-    stable_pulls.sort_by(|a, b| a.id.cmp(&b.id));
-    stable_pulls.dedup_by(|a, b| a.id == b.id);
-    for pull in &stable_pulls {
+    let mut seen_pull_ids = HashSet::<String>::new();
+    for (row_index, pull) in session.pulls.iter().enumerate() {
+        if !seen_pull_ids.insert(pull.id.clone()) {
+            continue;
+        }
         tx.execute(
             "
-            INSERT INTO import_pulls (id, scan_id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            INSERT INTO import_pulls (id, scan_id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at, row_index)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(scan_id, id)
             DO UPDATE SET
                 game_id = excluded.game_id,
@@ -2747,7 +2902,8 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
                 item_name = excluded.item_name,
                 item_type_name = excluded.item_type_name,
                 rarity = excluded.rarity,
-                pulled_at = excluded.pulled_at
+                pulled_at = excluded.pulled_at,
+                row_index = excluded.row_index
             ",
             params![
                 &pull.id,
@@ -2761,7 +2917,8 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
                 &pull.item_name,
                 &pull.item_type_name,
                 &pull.rarity,
-                &pull.pulled_at
+                &pull.pulled_at,
+                row_index as i64
             ],
         )
         .map_err(|e| format!("Failed writing import pull row: {e}"))?;
@@ -2914,10 +3071,10 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
     let mut pulls_stmt = conn
         .prepare(
             "
-            SELECT id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at
+            SELECT id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at, row_index
             FROM import_pulls
             WHERE scan_id = ?1
-            ORDER BY id ASC
+            ORDER BY row_index ASC, id ASC
             ",
         )
         .map_err(|e| format!("Failed preparing pulls query: {e}"))?;
@@ -3051,7 +3208,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_local_scan,
             run_local_import,
-            get_recent_scans
+            get_recent_scans,
+            get_latest_import_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
