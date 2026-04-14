@@ -1,6 +1,6 @@
 export type ImportStatus = "ready" | "missing" | "no-history";
 export type CompletenessMarker = "none" | "partial" | "full";
-export type SourceType = "log" | "cache" | "unknown";
+export type SourceType = "log" | "cache" | "network" | "unknown";
 export type DiagnosticSeverity = "info" | "warning" | "error";
 export type ManualFallbackStatus =
   | "not-configured"
@@ -61,8 +61,21 @@ export type ScanResponse = {
   networkPolicy: NetworkPolicyState;
   gameResults: GameScanResult[];
   findings: ScanFinding[];
+  historyPulls: HistoryPullRow[];
   notes: string[];
   troubleshooting: GameTroubleshooting[];
+};
+
+export type HistoryPullRow = {
+  gameId: string;
+  bannerId: string;
+  bannerName: string;
+  itemName: string;
+  itemTypeName: string;
+  rarity: number;
+  pulledAt: string;
+  pullId: string;
+  sourceUrl: string;
 };
 
 export type ScanSummary = {
@@ -82,6 +95,10 @@ export type Pull = {
   sourceType: SourceType;
   kind: string;
   value: string;
+  itemName?: string;
+  itemTypeName?: string;
+  rarity?: number;
+  pulledAt?: string;
 };
 
 export type Banner = {
@@ -150,15 +167,30 @@ const bannerIdFor = (gameId: string, kind: string): string =>
   `${gameId}:${bannerTypeFromKind(kind)}`;
 
 export function toImportSession(scan: ScanResponse): ImportSession {
-  const pulls: Pull[] = scan.findings.map((finding, index) => ({
-    id: `${scan.scanId}:${index}`,
-    gameId: finding.gameId,
-    bannerId: bannerIdFor(finding.gameId, finding.kind),
-    sourceFile: finding.sourceFile,
-    sourceType: sourceTypeFromPath(finding.sourceFile),
-    kind: finding.kind,
-    value: finding.value,
-  }));
+  const pulls: Pull[] =
+    scan.historyPulls.length > 0
+      ? scan.historyPulls.map((row, index) => ({
+          id: row.pullId || `${scan.scanId}:${index}`,
+          gameId: row.gameId,
+          bannerId: row.bannerId,
+          sourceFile: row.sourceUrl,
+          sourceType: "network",
+          kind: "history_pull",
+          value: row.itemName,
+          itemName: row.itemName,
+          itemTypeName: row.itemTypeName,
+          rarity: row.rarity,
+          pulledAt: row.pulledAt,
+        }))
+      : scan.findings.map((finding, index) => ({
+          id: `${scan.scanId}:${index}`,
+          gameId: finding.gameId,
+          bannerId: bannerIdFor(finding.gameId, finding.kind),
+          sourceFile: finding.sourceFile,
+          sourceType: sourceTypeFromPath(finding.sourceFile),
+          kind: finding.kind,
+          value: finding.value,
+        }));
 
   const bannersById = new Map<string, Banner>();
   for (const pull of pulls) {
@@ -166,8 +198,12 @@ export function toImportSession(scan: ScanResponse): ImportSession {
       bannersById.set(pull.bannerId, {
         id: pull.bannerId,
         gameId: pull.gameId,
-        name: bannerNameByGame[pull.gameId] ?? "Unknown banner",
-        pullType: bannerTypeFromKind(pull.kind),
+        name:
+          scan.historyPulls.find((row) => row.bannerId === pull.bannerId)
+            ?.bannerName ??
+          bannerNameByGame[pull.gameId] ??
+          "Unknown banner",
+        pullType: pull.kind === "history_pull" ? "history-url" : bannerTypeFromKind(pull.kind),
       });
     }
   }

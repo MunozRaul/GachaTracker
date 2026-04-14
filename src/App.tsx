@@ -500,17 +500,20 @@ function App() {
 
         <section className="panel panel-wide">
           <div className="panel-head">
-            <h2>Scan findings</h2>
-            <p className="panel-kicker">Sanitized extraction output</p>
+            <h2>Pull history</h2>
+            <p className="panel-kicker">
+              Imported wishes/pulls (falls back to extracted tokens when history is unavailable)
+            </p>
           </div>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Game</th>
+                  <th>Item</th>
+                  <th>Rarity</th>
                   <th>Type</th>
-                  <th>Source</th>
-                  <th>Value (sanitized)</th>
+                  <th>Pulled at</th>
                   <th>Source file</th>
                 </tr>
               </thead>
@@ -518,16 +521,17 @@ function App() {
                 {(importSession?.pulls ?? []).map((pull) => (
                   <tr key={pull.id}>
                     <td>{pull.gameId}</td>
-                    <td>{pull.kind}</td>
-                    <td>{pull.sourceType}</td>
-                    <td className="code">{pull.value}</td>
+                    <td>{pull.itemName ?? pull.value}</td>
+                    <td>{pull.rarity ? `★${pull.rarity}` : "-"}</td>
+                    <td>{pull.itemTypeName ?? pull.kind}</td>
+                    <td>{pull.pulledAt ?? "-"}</td>
                     <td className="code">{pull.sourceFile}</td>
                   </tr>
                 ))}
                 {!importSession?.pulls.length ? (
                   <tr>
-                    <td colSpan={5} className="muted center">
-                      No findings yet.
+                    <td colSpan={6} className="muted center">
+                      No pull history yet.
                     </td>
                   </tr>
                 ) : null}

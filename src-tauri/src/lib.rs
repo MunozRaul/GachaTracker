@@ -2,13 +2,16 @@ mod offline_adapter_sdk;
 
 use offline_adapter_sdk::{FunctionOfflineAdapter, OfflineAdapterRegistry};
 use regex::Regex;
+use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+use url::Url;
 use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +40,8 @@ struct ScanFinding {
     source_file: String,
     kind: String,
     value: String,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    raw_value: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,6 +66,7 @@ struct ScanResponse {
     network_policy: NetworkPolicyState,
     game_results: Vec<GameScanResult>,
     findings: Vec<ScanFinding>,
+    history_pulls: Vec<HistoryPullRow>,
     notes: Vec<String>,
     troubleshooting: Vec<GameTroubleshooting>,
 }
@@ -86,6 +92,10 @@ struct Pull {
     source_type: String,
     kind: String,
     value: String,
+    item_name: Option<String>,
+    item_type_name: Option<String>,
+    rarity: Option<i64>,
+    pulled_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -139,6 +149,20 @@ struct RunLocalImportResponse {
     import_session: ImportSession,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HistoryPullRow {
+    game_id: String,
+    banner_id: String,
+    banner_name: String,
+    item_name: String,
+    item_type_name: String,
+    rarity: i64,
+    pulled_at: String,
+    pull_id: String,
+    source_url: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NetworkPolicyState {
@@ -183,8 +207,17 @@ struct NetworkPolicy {
     allow_official_api_exceptions: bool,
 }
 
-const CONFIRMED_OFFICIAL_API_HOSTS: [&str; 0] = [];
-const DB_SCHEMA_VERSION: i64 = 3;
+const CONFIRMED_OFFICIAL_API_HOSTS: [&str; 8] = [
+    "gmserver-api.aki-game2.com",
+    "gmserver-api.aki-game2.net",
+    "public-operation-hkrpg.mihoyo.com",
+    "public-operation-hkrpg.hoyoverse.com",
+    "public-operation-hkrpg-sg.hoyoverse.com",
+    "public-operation-hkrpg-os.hoyoverse.com",
+    "public-operation-nap.hoyoverse.com",
+    "public-operation-nap-sg.hoyoverse.com",
+];
+const DB_SCHEMA_VERSION: i64 = 4;
 const WUWA_ROOT_DIR_HINTS: [&str; 4] = [
     "WutheringWaves",
     "Wuthering Waves",
@@ -263,27 +296,36 @@ impl NetworkPolicy {
 }
 
 #[tauri::command]
-fn run_local_scan(app: tauri::AppHandle, request: ScanRequest) -> Result<ScanResponse, String> {
-    execute_local_scan(&app, &request)
+async fn run_local_scan(
+    app: tauri::AppHandle,
+    request: ScanRequest,
+) -> Result<ScanResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || execute_local_scan(&app, &request))
+        .await
+        .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 #[tauri::command]
-fn run_local_import(
+async fn run_local_import(
     app: tauri::AppHandle,
     request: ScanRequest,
 ) -> Result<RunLocalImportResponse, String> {
-    let scan = execute_local_scan(&app, &request)?;
-    let import_session = build_import_session(&scan);
-    let db_path = database_path(&app)?;
-    let mut conn = open_db(&db_path)?;
-    persist_import_session(&mut conn, &import_session)?;
-    recompute_import_summary(&conn, import_session.id)?;
-    let recomputed = load_import_session(&conn, import_session.id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan = execute_local_scan(&app, &request)?;
+        let import_session = build_import_session(&scan);
+        let db_path = database_path(&app)?;
+        let mut conn = open_db(&db_path)?;
+        persist_import_session(&mut conn, &import_session)?;
+        recompute_import_summary(&conn, import_session.id)?;
+        let recomputed = load_import_session(&conn, import_session.id)?;
 
-    Ok(RunLocalImportResponse {
-        scan,
-        import_session: recomputed,
+        Ok(RunLocalImportResponse {
+            scan,
+            import_session: recomputed,
+        })
     })
+    .await
+    .map_err(|e| format!("Import task failed: {e}"))?
 }
 
 fn execute_local_scan(
@@ -382,6 +424,31 @@ fn execute_local_scan(
     }
     dedup_findings(&mut all_findings);
     recompute_game_results_from_findings(&mut game_results, &all_findings);
+    let mut history_pulls = Vec::<HistoryPullRow>::new();
+    if policy.online_calls_allowed() {
+        match fetch_history_pulls_from_tokens(&all_findings, &policy) {
+            Ok(rows) => {
+                history_pulls = rows;
+                apply_history_pulls_to_game_results(&mut game_results, &history_pulls);
+                if !history_pulls.is_empty() {
+                    notes.push(format!(
+                        "Fetched {} pull-history rows from official game endpoints.",
+                        history_pulls.len()
+                    ));
+                }
+            }
+            Err(err) => {
+                notes.push(format!(
+                    "Official API history fetch failed ({err}). Showing local findings only."
+                ));
+            }
+        }
+    } else {
+        notes.push(
+            "Full pull history fetch is disabled by policy. Enable official API exceptions to load complete history."
+                .to_string(),
+        );
+    }
     let troubleshooting = build_game_troubleshooting(&game_results, &troubleshooting_drafts);
 
     let network_policy = build_network_policy_state(&policy, &all_findings);
@@ -424,6 +491,7 @@ fn execute_local_scan(
         network_policy,
         game_results,
         findings: all_findings,
+        history_pulls,
         notes,
         troubleshooting,
     })
@@ -497,9 +565,25 @@ fn banner_name_by_game(game_id: &str) -> &'static str {
     }
 }
 
+fn banner_name_from_banner_id(game_id: &str, banner_id: &str) -> String {
+    let suffix = banner_id.split(':').nth(1).unwrap_or_default();
+    if game_id == "wuthering-waves" {
+        if let Ok(card_pool_type) = suffix.parse::<i64>() {
+            return wuwa_banner_name(card_pool_type).to_string();
+        }
+        return banner_name_by_game(game_id).to_string();
+    }
+    if game_id == "honkai-star-rail" || game_id == "zenless-zone-zero" {
+        return hoyo_banner_name(game_id, suffix);
+    }
+    banner_name_by_game(game_id).to_string()
+}
+
 fn banner_pull_type_from_kind(kind: &str) -> &'static str {
     if kind == "possible_history_source" {
         "possible-source"
+    } else if kind == "history_pull" {
+        "history-pull"
     } else {
         "history-url"
     }
@@ -510,20 +594,47 @@ fn banner_id_for(game_id: &str, kind: &str) -> String {
 }
 
 fn build_import_session(scan: &ScanResponse) -> ImportSession {
-    let pulls: Vec<Pull> = scan
-        .findings
-        .iter()
-        .enumerate()
-        .map(|(index, finding)| Pull {
-            id: format!("{}:{index}", scan.scan_id),
-            game_id: finding.game_id.clone(),
-            banner_id: banner_id_for(&finding.game_id, &finding.kind),
-            source_file: finding.source_file.clone(),
-            source_type: source_type_from_path(&finding.source_file).to_string(),
-            kind: finding.kind.clone(),
-            value: finding.value.clone(),
-        })
-        .collect();
+    let pulls: Vec<Pull> = if !scan.history_pulls.is_empty() {
+        scan.history_pulls
+            .iter()
+            .enumerate()
+            .map(|(index, row)| Pull {
+                id: if row.pull_id.is_empty() {
+                    format!("{}:{index}", scan.scan_id)
+                } else {
+                    row.pull_id.clone()
+                },
+                game_id: row.game_id.clone(),
+                banner_id: row.banner_id.clone(),
+                source_file: row.source_url.clone(),
+                source_type: "network".to_string(),
+                kind: "history_pull".to_string(),
+                value: row.item_name.clone(),
+                item_name: Some(row.item_name.clone()),
+                item_type_name: Some(row.item_type_name.clone()),
+                rarity: Some(row.rarity),
+                pulled_at: Some(row.pulled_at.clone()),
+            })
+            .collect()
+    } else {
+        scan.findings
+            .iter()
+            .enumerate()
+            .map(|(index, finding)| Pull {
+                id: format!("{}:{index}", scan.scan_id),
+                game_id: finding.game_id.clone(),
+                banner_id: banner_id_for(&finding.game_id, &finding.kind),
+                source_file: finding.source_file.clone(),
+                source_type: source_type_from_path(&finding.source_file).to_string(),
+                kind: finding.kind.clone(),
+                value: finding.value.clone(),
+                item_name: None,
+                item_type_name: None,
+                rarity: None,
+                pulled_at: None,
+            })
+            .collect()
+    };
 
     let mut banners_by_id = BTreeMap::<String, Banner>::new();
     for pull in &pulls {
@@ -532,7 +643,7 @@ fn build_import_session(scan: &ScanResponse) -> ImportSession {
             .or_insert(Banner {
                 id: pull.banner_id.clone(),
                 game_id: pull.game_id.clone(),
-                name: banner_name_by_game(&pull.game_id).to_string(),
+                name: banner_name_from_banner_id(&pull.game_id, &pull.banner_id),
                 pull_type: banner_pull_type_from_kind(&pull.kind).to_string(),
             });
     }
@@ -672,17 +783,13 @@ fn available_drive_roots() -> Vec<PathBuf> {
 }
 
 fn game_artifacts_exist_for_root(game_id: &str, root: &Path) -> bool {
+    if game_id == "wuthering-waves" {
+        return build_wuwa_log_candidates(root)
+            .into_iter()
+            .any(|candidate| candidate.exists() && candidate.is_file());
+    }
+
     let (game_root_hints, files): (&[&str], &[&str]) = match game_id {
-        "wuthering-waves" => (
-            &WUWA_ROOT_DIR_HINTS,
-            &[
-                "Client.log",
-                "debug.log",
-                "Client\\Saved\\Logs\\Client.log",
-                "Client\\Saved\\Logs\\Client-Win64-Shipping.log",
-                "Client\\Saved\\Logs\\debug.log",
-            ],
-        ),
         "honkai-star-rail" => (
             &HSR_ROOT_DIR_HINTS,
             &[
@@ -759,8 +866,12 @@ fn build_checked_path_hints(game_id: &str, effective_root: &Path) -> Vec<String>
 
     match game_id {
         "wuthering-waves" => {
-            hints.push(effective_root.join("Client.log").display().to_string());
-            hints.push(effective_root.join("debug.log").display().to_string());
+            for path in build_wuwa_log_candidates(effective_root)
+                .into_iter()
+                .take(6)
+            {
+                hints.push(path.display().to_string());
+            }
         }
         _ => {
             hints.push(effective_root.join("Player.log").display().to_string());
@@ -817,6 +928,390 @@ fn recompute_game_results_from_findings(
                     .to_string();
         }
     }
+}
+
+fn apply_history_pulls_to_game_results(
+    game_results: &mut [GameScanResult],
+    history_pulls: &[HistoryPullRow],
+) {
+    let mut pulls_by_game = BTreeMap::<String, usize>::new();
+    for row in history_pulls {
+        *pulls_by_game.entry(row.game_id.clone()).or_insert(0) += 1;
+    }
+
+    for game in game_results {
+        let total = pulls_by_game.get(&game.game_id).copied().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        game.status = "ready".to_string();
+        game.completeness = "full".to_string();
+        game.findings_count = total;
+        game.note = format!("Loaded {total} pull-history rows from official API.");
+    }
+}
+
+fn wuwa_banner_name(card_pool_type: i64) -> &'static str {
+    match card_pool_type {
+        1 => "Character Event",
+        2 => "Weapon Event",
+        3 => "Character Standard",
+        4 => "Weapon Standard",
+        5 => "Novice",
+        6 => "Beginner Choice",
+        7 => "Beginner Choice (Gratitude)",
+        _ => "Wuthering Waves",
+    }
+}
+
+fn hoyo_banner_name(game_id: &str, gacha_type: &str) -> String {
+    if game_id == "honkai-star-rail" {
+        match gacha_type {
+            "1" => "Stellar Warp",
+            "2" => "Departure Warp",
+            "11" => "Character Event Warp",
+            "12" => "Light Cone Event Warp",
+            _ => "Warp",
+        }
+        .to_string()
+    } else {
+        match gacha_type {
+            "1" => "Stable Channel",
+            "2" => "Exclusive Channel",
+            "3" => "W-Engine Channel",
+            "5" => "Bangboo Channel",
+            "2001" => "Exclusive Channel",
+            "2002" => "W-Engine Channel",
+            "3001" => "Stable Channel",
+            "5001" => "Bangboo Channel",
+            _ => "Signal Search",
+        }
+        .to_string()
+    }
+}
+
+fn query_map_from_token_url(token_url: &str) -> Option<BTreeMap<String, String>> {
+    let parsed = Url::parse(token_url).ok()?;
+    let mut out = BTreeMap::<String, String>::new();
+
+    for (k, v) in parsed.query_pairs() {
+        out.insert(k.to_string(), v.to_string());
+    }
+    if out.is_empty() {
+        if let Some(fragment) = parsed.fragment() {
+            if let Some(idx) = fragment.find('?') {
+                let query = &fragment[idx + 1..];
+                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+                    out.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn history_timeout_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("GachaTrackerDesktop/0.1.0")
+        .build()
+        .map_err(|e| format!("Failed creating HTTP client: {e}"))
+}
+
+fn fetch_wuwa_history_from_token(
+    token_url: &str,
+    policy: &NetworkPolicy,
+    client: &Client,
+) -> Result<Vec<HistoryPullRow>, String> {
+    let query = query_map_from_token_url(token_url)
+        .ok_or_else(|| "WuWa token URL is missing required query params.".to_string())?;
+
+    let server_id = query
+        .get("svr_id")
+        .cloned()
+        .ok_or_else(|| "WuWa token missing svr_id.".to_string())?;
+    let player_id = query
+        .get("player_id")
+        .cloned()
+        .ok_or_else(|| "WuWa token missing player_id.".to_string())?;
+    let language_code = query
+        .get("lang")
+        .cloned()
+        .unwrap_or_else(|| "en".to_string());
+    let record_id = query
+        .get("record_id")
+        .cloned()
+        .ok_or_else(|| "WuWa token missing record_id.".to_string())?;
+    let card_pool_id = query
+        .get("resources_id")
+        .cloned()
+        .ok_or_else(|| "WuWa token missing resources_id.".to_string())?;
+
+    let host = Url::parse(token_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let api_base = if host.contains(".aki-game.net") {
+        "https://gmserver-api.aki-game2.net"
+    } else {
+        "https://gmserver-api.aki-game2.com"
+    };
+    let api_url = format!("{api_base}/gacha/record/query");
+    policy.assert_url_allowed(&api_url)?;
+
+    let mut rows = Vec::<HistoryPullRow>::new();
+    for card_pool_type in 1..=7 {
+        let payload = serde_json::json!({
+            "serverId": server_id,
+            "playerId": player_id,
+            "languageCode": language_code,
+            "recordId": record_id,
+            "cardPoolId": card_pool_id,
+            "cardPoolType": card_pool_type,
+        });
+
+        let response = client
+            .post(&api_url)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("WuWa history request failed: {e}"))?;
+        let response_json: Value = response
+            .json()
+            .map_err(|e| format!("WuWa history response parse failed: {e}"))?;
+
+        let list = if let Some(array) = response_json.as_array() {
+            array.to_vec()
+        } else if let Some(array) = response_json.get("data").and_then(Value::as_array) {
+            array.to_vec()
+        } else if let Some(array) = response_json.get("result").and_then(Value::as_array) {
+            array.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        for entry in list {
+            let item_name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+            let item_type_name = entry
+                .get("resourceType")
+                .or_else(|| entry.get("itemType"))
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+            let rarity = entry
+                .get("qualityLevel")
+                .or_else(|| entry.get("rankType"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let pulled_at = entry
+                .get("time")
+                .or_else(|| entry.get("createTime"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pull_id = entry
+                .get("resourceId")
+                .or_else(|| entry.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("{item_name}:{pulled_at}:{card_pool_type}"));
+
+            rows.push(HistoryPullRow {
+                game_id: "wuthering-waves".to_string(),
+                banner_id: format!("wuthering-waves:{card_pool_type}"),
+                banner_name: wuwa_banner_name(card_pool_type).to_string(),
+                item_name,
+                item_type_name,
+                rarity,
+                pulled_at,
+                pull_id,
+                source_url: sanitize_url(token_url),
+            });
+        }
+    }
+
+    Ok(rows)
+}
+
+fn fetch_hoyo_history_from_token(
+    game_id: &str,
+    token_url: &str,
+    policy: &NetworkPolicy,
+    client: &Client,
+) -> Result<Vec<HistoryPullRow>, String> {
+    policy.assert_url_allowed(token_url)?;
+    let parsed = Url::parse(token_url).map_err(|e| format!("Invalid token URL: {e}"))?;
+    let banner_types: Vec<&str> = if game_id == "honkai-star-rail" {
+        vec!["1", "2", "11", "12"]
+    } else {
+        vec!["1", "2", "3", "5", "2001", "2002", "3001", "5001"]
+    };
+
+    let mut rows = Vec::<HistoryPullRow>::new();
+    for banner_type in banner_types {
+        let mut end_id = "0".to_string();
+        for page in 1..=50 {
+            let mut page_url = parsed.clone();
+            {
+                let mut query_pairs = page_url.query_pairs_mut();
+                query_pairs.append_pair("gacha_type", banner_type);
+                query_pairs.append_pair("page", &page.to_string());
+                query_pairs.append_pair("size", "20");
+                query_pairs.append_pair("end_id", &end_id);
+            }
+            let response = client
+                .get(page_url.as_str())
+                .send()
+                .map_err(|e| format!("History request failed for {game_id}: {e}"))?;
+            let payload: Value = response
+                .json()
+                .map_err(|e| format!("History JSON parse failed for {game_id}: {e}"))?;
+
+            let retcode = payload
+                .get("retcode")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            if retcode != 0 {
+                break;
+            }
+            let Some(list) = payload
+                .get("data")
+                .and_then(|v| v.get("list"))
+                .and_then(Value::as_array)
+            else {
+                break;
+            };
+
+            if list.is_empty() {
+                break;
+            }
+
+            for entry in list {
+                let gacha_type = entry
+                    .get("gacha_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or(banner_type);
+                let item_name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let item_type_name = entry
+                    .get("item_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let rarity = entry
+                    .get("rank_type")
+                    .and_then(Value::as_str)
+                    .and_then(|rank| rank.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let pulled_at = entry
+                    .get("time")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let pull_id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{item_name}:{pulled_at}:{gacha_type}"));
+
+                rows.push(HistoryPullRow {
+                    game_id: game_id.to_string(),
+                    banner_id: format!("{game_id}:{gacha_type}"),
+                    banner_name: hoyo_banner_name(game_id, gacha_type),
+                    item_name,
+                    item_type_name,
+                    rarity,
+                    pulled_at,
+                    pull_id,
+                    source_url: sanitize_url(token_url),
+                });
+            }
+
+            if list.len() < 20 {
+                break;
+            }
+            end_id = list
+                .last()
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("0")
+                .to_string();
+            if end_id == "0" {
+                break;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn dedup_history_pulls(rows: &mut Vec<HistoryPullRow>) {
+    let mut seen = HashSet::<(String, String, String, String)>::new();
+    rows.retain(|row| {
+        seen.insert((
+            row.game_id.clone(),
+            row.banner_id.clone(),
+            row.pull_id.clone(),
+            row.item_name.clone(),
+        ))
+    });
+}
+
+fn fetch_history_pulls_from_tokens(
+    findings: &[ScanFinding],
+    policy: &NetworkPolicy,
+) -> Result<Vec<HistoryPullRow>, String> {
+    let client = history_timeout_client()?;
+    let mut rows = Vec::<HistoryPullRow>::new();
+    let mut errors = Vec::<String>::new();
+    let mut attempts_by_game = BTreeMap::<String, usize>::new();
+
+    for finding in findings {
+        if finding.kind != "url_token" {
+            continue;
+        }
+        let attempts = attempts_by_game.entry(finding.game_id.clone()).or_insert(0);
+        if *attempts >= 2 {
+            continue;
+        }
+        let token_url = finding.raw_value.as_deref().unwrap_or(&finding.value);
+        if finding.game_id == "wuthering-waves" && token_url.contains("/aki/gacha/index.html#/record")
+        {
+            *attempts += 1;
+            match fetch_wuwa_history_from_token(token_url, policy, &client) {
+                Ok(fetched) => {
+                    rows.extend(fetched);
+                    *attempts = 2;
+                }
+                Err(err) => errors.push(format!("wuthering-waves: {err}")),
+            }
+            continue;
+        }
+        if (finding.game_id == "honkai-star-rail" || finding.game_id == "zenless-zone-zero")
+            && (token_url.contains("getGachaLog") || token_url.contains("getLdGachaLog"))
+        {
+            *attempts += 1;
+            match fetch_hoyo_history_from_token(&finding.game_id, token_url, policy, &client) {
+                Ok(fetched) => {
+                    rows.extend(fetched);
+                    *attempts = 2;
+                }
+                Err(err) => errors.push(format!("{}: {err}", finding.game_id)),
+            }
+        }
+    }
+
+    if rows.is_empty() && !errors.is_empty() {
+        return Err(errors.join(" | "));
+    }
+    dedup_history_pulls(&mut rows);
+    Ok(rows)
 }
 
 fn build_next_steps(game: &GameScanResult, draft: Option<&TroubleshootingDraft>) -> Vec<String> {
@@ -957,14 +1452,140 @@ fn build_log_candidates(root: &Path, game_roots: &[&str], file_names: &[&str]) -
     out
 }
 
+fn wuwa_install_roots(root: &Path) -> Vec<PathBuf> {
+    let candidates = vec![
+        root.join("WutheringWaves"),
+        root.join("Wuthering Waves"),
+        root.join("WutheringWaves Game"),
+        root.join("Wuthering Waves Game"),
+        root.join("Wuthering Waves").join("Wuthering Waves Game"),
+        root.join("Games").join("Wuthering Waves Game"),
+        root.join("Games")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files (x86)")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("SteamLibrary")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves"),
+        root.join("SteamLibrary")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves"),
+        root.join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves"),
+        root.join("Program Files")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files (x86)")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves"),
+        root.join("Program Files (x86)")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Games")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves"),
+        root.join("Games")
+            .join("Steam")
+            .join("steamapps")
+            .join("common")
+            .join("Wuthering Waves")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files")
+            .join("Epic Games")
+            .join("WutheringWavesj3oFh"),
+        root.join("Program Files")
+            .join("Epic Games")
+            .join("WutheringWavesj3oFh")
+            .join("Wuthering Waves Game"),
+        root.join("Program Files (x86)")
+            .join("Epic Games")
+            .join("WutheringWavesj3oFh"),
+        root.join("Program Files (x86)")
+            .join("Epic Games")
+            .join("WutheringWavesj3oFh")
+            .join("Wuthering Waves Game"),
+    ];
+    let mut out = candidates;
+    dedup_paths(&mut out);
+    out
+}
+
+fn build_wuwa_log_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::<PathBuf>::new();
+    let install_roots = wuwa_install_roots(root);
+    let log_suffixes = [
+        PathBuf::from("Client.log"),
+        PathBuf::from("debug.log"),
+        PathBuf::from("Client").join("Saved").join("Logs").join("Client.log"),
+        PathBuf::from("Client")
+            .join("Saved")
+            .join("Logs")
+            .join("Client-Win64-Shipping.log"),
+        PathBuf::from("Client").join("Saved").join("Logs").join("debug.log"),
+        PathBuf::from("Client")
+            .join("Binaries")
+            .join("Win64")
+            .join("ThirdParty")
+            .join("KrPcSdk_Global")
+            .join("KRSDKRes")
+            .join("KRSDKWebView")
+            .join("debug.log"),
+    ];
+
+    for install_root in install_roots {
+        for suffix in &log_suffixes {
+            candidates.push(install_root.join(suffix));
+        }
+    }
+    candidates.push(root.join("Client.log"));
+    candidates.push(root.join("debug.log"));
+    dedup_paths(&mut candidates);
+    candidates
+}
+
 fn dedup_findings(findings: &mut Vec<ScanFinding>) {
     let mut seen = HashSet::<(String, String, String, String)>::new();
     findings.retain(|finding| {
+        let dedup_value = finding
+            .raw_value
+            .as_deref()
+            .unwrap_or(&finding.value)
+            .to_string();
         seen.insert((
             finding.game_id.clone(),
             finding.source_file.clone(),
             finding.kind.clone(),
-            finding.value.clone(),
+            dedup_value,
         ))
     });
 }
@@ -973,19 +1594,7 @@ fn scan_wuwa(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> 
     let game_id = "wuthering-waves".to_string();
     let mut findings = Vec::<ScanFinding>::new();
 
-    let mut log_candidates = build_log_candidates(
-        root,
-        &WUWA_ROOT_DIR_HINTS,
-        &[
-            "Client.log",
-            "debug.log",
-            "Client\\Saved\\Logs\\Client.log",
-            "Client\\Saved\\Logs\\Client-Win64-Shipping.log",
-            "Client\\Saved\\Logs\\debug.log",
-        ],
-    );
-    log_candidates.push(root.join("Client.log"));
-    log_candidates.push(root.join("debug.log"));
+    let mut log_candidates = build_wuwa_log_candidates(root);
     if let Some(local_low) = local_low_path() {
         for vendor in ["KuroGame", "Kuro Games"] {
             for root_name in ["WutheringWaves", "Wuthering Waves"] {
@@ -1023,6 +1632,7 @@ fn scan_wuwa(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> 
                 source_file: log_file.display().to_string(),
                 kind: "url_token".to_string(),
                 value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
+                raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
             });
         }
     }
@@ -1033,7 +1643,7 @@ fn scan_wuwa(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> 
         files.len(),
         findings.len(),
         if files.is_empty() {
-            "No WuWa local logs detected from known install locations under root path."
+            "No WuWa local logs detected from known install locations."
         } else if findings.is_empty() {
             "WuWa logs detected, but no convene history token was found."
         } else {
@@ -1159,6 +1769,7 @@ fn scan_zzz(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), String> {
                 source_file: log.display().to_string(),
                 kind: "url_token".to_string(),
                 value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
+                raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
             });
         }
         findings.extend(extract_gacha_log_findings(&text, &game_id, log)?);
@@ -1254,6 +1865,7 @@ fn scan_endfield(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), Stri
                     source_file: log.display().to_string(),
                     kind: "possible_history_source".to_string(),
                     value: sanitize_url(candidate),
+                    raw_value: Some(candidate.to_string()),
                 });
             }
         }
@@ -1542,6 +2154,7 @@ fn extract_gacha_log_findings(
             source_file: source.display().to_string(),
             kind: "url_token".to_string(),
             value: sanitize_url(trim_trailing_delimiters(hit.as_str())),
+            raw_value: Some(trim_trailing_delimiters(hit.as_str()).to_string()),
         });
     }
     Ok(findings)
@@ -1815,6 +2428,10 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
                 source_type TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 value TEXT NOT NULL,
+                item_name TEXT NULL,
+                item_type_name TEXT NULL,
+                rarity INTEGER NULL,
+                pulled_at TEXT NULL,
                 PRIMARY KEY(scan_id, id),
                 FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE
             );
@@ -1877,6 +2494,29 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         current_version = 3;
         tx.pragma_update(None, "user_version", current_version)
             .map_err(|e| format!("Failed updating schema version to v3: {e}"))?;
+    }
+
+    if current_version < 4 {
+        tx.execute_batch(
+            "
+            ALTER TABLE import_pulls ADD COLUMN item_name TEXT NULL;
+            ALTER TABLE import_pulls ADD COLUMN item_type_name TEXT NULL;
+            ALTER TABLE import_pulls ADD COLUMN rarity INTEGER NULL;
+            ALTER TABLE import_pulls ADD COLUMN pulled_at TEXT NULL;
+            ",
+        )
+        .or_else(|_| Ok(()))
+        .map_err(|e: rusqlite::Error| format!("Failed applying schema migration v4: {e}"))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![4i64, unix_ts() as i64],
+        )
+        .map_err(|e| format!("Failed recording migration v4: {e}"))?;
+
+        current_version = 4;
+        tx.pragma_update(None, "user_version", current_version)
+            .map_err(|e| format!("Failed updating schema version to v4: {e}"))?;
     }
 
     if current_version > DB_SCHEMA_VERSION {
@@ -2094,8 +2734,8 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
     for pull in &stable_pulls {
         tx.execute(
             "
-            INSERT INTO import_pulls (id, scan_id, game_id, banner_id, source_file, source_type, kind, value)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            INSERT INTO import_pulls (id, scan_id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(scan_id, id)
             DO UPDATE SET
                 game_id = excluded.game_id,
@@ -2103,7 +2743,11 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
                 source_file = excluded.source_file,
                 source_type = excluded.source_type,
                 kind = excluded.kind,
-                value = excluded.value
+                value = excluded.value,
+                item_name = excluded.item_name,
+                item_type_name = excluded.item_type_name,
+                rarity = excluded.rarity,
+                pulled_at = excluded.pulled_at
             ",
             params![
                 &pull.id,
@@ -2113,7 +2757,11 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
                 &pull.source_file,
                 &pull.source_type,
                 &pull.kind,
-                &pull.value
+                &pull.value,
+                &pull.item_name,
+                &pull.item_type_name,
+                &pull.rarity,
+                &pull.pulled_at
             ],
         )
         .map_err(|e| format!("Failed writing import pull row: {e}"))?;
@@ -2266,7 +2914,7 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
     let mut pulls_stmt = conn
         .prepare(
             "
-            SELECT id, game_id, banner_id, source_file, source_type, kind, value
+            SELECT id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at
             FROM import_pulls
             WHERE scan_id = ?1
             ORDER BY id ASC
@@ -2283,6 +2931,10 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
                 source_type: row.get(4)?,
                 kind: row.get(5)?,
                 value: row.get(6)?,
+                item_name: row.get(7)?,
+                item_type_name: row.get(8)?,
+                rarity: row.get(9)?,
+                pulled_at: row.get(10)?,
             })
         })
         .map_err(|e| format!("Failed querying import pulls: {e}"))?;
@@ -2390,7 +3042,11 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             run_local_scan,
@@ -2427,6 +3083,7 @@ mod tests {
             },
             game_results,
             findings,
+            history_pulls: Vec::new(),
             notes: notes.into_iter().map(ToString::to_string).collect(),
             troubleshooting: Vec::new(),
         }
@@ -2561,6 +3218,31 @@ Booted
     }
 
     #[test]
+    fn wuwa_log_candidates_include_launcher_nested_paths() {
+        let root = PathBuf::from(r"D:\");
+        let candidates = build_wuwa_log_candidates(&root);
+        let normalized: Vec<String> = candidates
+            .iter()
+            .map(|path| normalize_path_key(path))
+            .collect();
+
+        let expected = normalize_path_key(
+            &root
+                .join("Games")
+                .join("Wuthering Waves")
+                .join("Wuthering Waves Game")
+                .join("Client")
+                .join("Saved")
+                .join("Logs")
+                .join("Client.log"),
+        );
+        assert!(
+            normalized.iter().any(|path| path == &expected),
+            "WuWa candidates should include nested launcher path pattern"
+        );
+    }
+
+    #[test]
     fn build_import_session_aggregates_sources_and_banners() {
         let scan = sample_scan_response(
             vec![
@@ -2587,18 +3269,21 @@ Booted
                     source_file: r"C:\Logs\Player.log".to_string(),
                     kind: "url_token".to_string(),
                     value: "https://example.com/getGachaLog?authkey=[REDACTED]".to_string(),
+                    raw_value: None,
                 },
                 ScanFinding {
                     game_id: "endfield".to_string(),
                     source_file: r"C:\Caches\Cache\Cache_Data\data_2".to_string(),
                     kind: "possible_history_source".to_string(),
                     value: "https://example.com/gacha/source/1".to_string(),
+                    raw_value: None,
                 },
                 ScanFinding {
                     game_id: "endfield".to_string(),
                     source_file: r"C:\Caches\Cache\Cache_Data\data_2".to_string(),
                     kind: "possible_history_source".to_string(),
                     value: "https://example.com/gacha/source/2".to_string(),
+                    raw_value: None,
                 },
             ],
             vec!["strict-local-only"],
