@@ -512,6 +512,18 @@ button:disabled {
   color: #94efc1;
 }
 
+.chip-warn {
+  background: rgba(234, 161, 57, 0.2);
+  border-color: #d2963c;
+  color: #ffd694;
+}
+
+.chip-danger {
+  background: rgba(197, 78, 78, 0.22);
+  border-color: #b74a4a;
+  color: #ffb8b8;
+}
+
 .chip-missing,
 .chip-no-history {
   background: rgba(178, 88, 88, 0.2);

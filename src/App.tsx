@@ -154,6 +154,16 @@ function App() {
     return summary.reverse();
   }, [visibleRows]);
 
+  const summaryChipClass = (pullsToFive: number) => {
+    if (pullsToFive <= 40) {
+      return "chip-ready";
+    }
+    if (pullsToFive <= 65) {
+      return "chip-warn";
+    }
+    return "chip-danger";
+  };
+
   async function runScanForGame(gameId: string) {
     setError("");
     setSelectedGameId(gameId);
@@ -361,7 +371,7 @@ function App() {
                     <article key={entry.id} className="five-star-card">
                       <strong>{entry.itemName}</strong>
                       <span className="muted">{entry.pulledAt}</span>
-                      <span className="chip chip-ready">
+                      <span className={`chip ${summaryChipClass(entry.pullsToFive)}`}>
                         {entry.pullsToFive} pulls to 5★
                       </span>
                     </article>
