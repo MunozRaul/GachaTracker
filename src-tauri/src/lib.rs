@@ -1152,7 +1152,7 @@ fn fetch_wuwa_history_from_token(
             find_wuwa_items_array(&response_json).unwrap_or_default()
         };
 
-        for entry in list {
+        for (entry_index, entry) in list.into_iter().enumerate() {
             let item_name = entry
                 .get("name")
                 .or_else(|| entry.get("Name"))
@@ -1180,14 +1180,17 @@ fn fetch_wuwa_history_from_token(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let pull_id = entry
-                .get("resourceId")
-                .or_else(|| entry.get("ResourceId"))
-                .or_else(|| entry.get("id"))
+            let record_hint = entry
+                .get("id")
                 .or_else(|| entry.get("Id"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("{item_name}:{pulled_at}:{card_pool_type}"));
+                .or_else(|| entry.get("recordId"))
+                .or_else(|| entry.get("RecordId"))
+                .or_else(|| entry.get("gachaId"))
+                .or_else(|| entry.get("GachaId"))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            let pull_id =
+                format!("ww:{card_pool_type}:{pulled_at}:{item_name}:{entry_index}:{record_hint}");
 
             rows.push(HistoryPullRow {
                 game_id: "wuthering-waves".to_string(),

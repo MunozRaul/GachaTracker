@@ -76,12 +76,7 @@ function App() {
 
   const actualGamePulls = useMemo(
     () =>
-      selectedGamePulls.filter(
-        (pull) =>
-          pull.kind === "history_pull" &&
-          Boolean(pull.itemName) &&
-          Boolean(pull.pulledAt),
-      ),
+      selectedGamePulls.filter((pull) => pull.kind === "history_pull"),
     [selectedGamePulls],
   );
 
@@ -129,6 +124,35 @@ function App() {
     () => visibleRows.filter((pull) => pull.rarity !== 3),
     [visibleRows],
   );
+
+  const fiveStarSummary = useMemo(() => {
+    // The imported pull stream is newest -> oldest. Reverse once so pity counts
+    // are computed from older pulls toward newer pulls.
+    const chronologicalRows = [...visibleRows].reverse();
+
+    let pullsSinceLastFive = 0;
+    const summary = [] as Array<{
+      id: string;
+      itemName: string;
+      pulledAt: string;
+      pullsToFive: number;
+    }>;
+
+    for (const pull of chronologicalRows) {
+      pullsSinceLastFive += 1;
+      if (pull.rarity === 5) {
+        summary.push({
+          id: pull.id,
+          itemName: pull.itemName ?? pull.value,
+          pulledAt: pull.pulledAt ?? "-",
+          pullsToFive: pullsSinceLastFive,
+        });
+        pullsSinceLastFive = 0;
+      }
+    }
+
+    return summary.reverse();
+  }, [visibleRows]);
 
   async function runScanForGame(gameId: string) {
     setError("");
@@ -323,6 +347,32 @@ function App() {
                 </table>
               </div>
             </div>
+
+            <aside className="summary-sidebar">
+              <div className="panel-head">
+                <h2>5★ summary</h2>
+                <p className="panel-kicker">
+                  Pulls needed between consecutive 5★ entries
+                </p>
+              </div>
+              {fiveStarSummary.length ? (
+                <div className="five-star-list">
+                  {fiveStarSummary.map((entry) => (
+                    <article key={entry.id} className="five-star-card">
+                      <strong>{entry.itemName}</strong>
+                      <span className="muted">{entry.pulledAt}</span>
+                      <span className="chip chip-ready">
+                        {entry.pullsToFive} pulls to 5★
+                      </span>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="empty-state">
+                  No 5★ pulls found for the selected convene yet.
+                </p>
+              )}
+            </aside>
           </div>
         </section>
       )}
