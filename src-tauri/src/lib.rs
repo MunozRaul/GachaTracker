@@ -1397,7 +1397,9 @@ fn fetch_history_pulls_from_tokens(
             }
             continue;
         }
-        if (finding.game_id == "honkai-star-rail" || finding.game_id == "zenless-zone-zero")
+        if (finding.game_id == "honkai-star-rail"
+            || finding.game_id == "zenless-zone-zero"
+            || finding.game_id == "endfield")
             && (token_url.contains("getGachaLog") || token_url.contains("getLdGachaLog"))
         {
             *attempts += 1;
@@ -1978,15 +1980,21 @@ fn scan_endfield(root: &Path) -> Result<(Vec<ScanFinding>, GameScanResult), Stri
 
         for hit in generic_pattern.find_iter(&text) {
             let candidate = normalize_logged_url(hit.as_str());
-            if candidate.contains("gacha")
-                || candidate.contains("wish")
-                || candidate.contains("pool")
-                || candidate.contains("authkey")
-            {
+            let candidate_lower = candidate.to_ascii_lowercase();
+            let looks_like_history_source = candidate_lower.contains("gacha")
+                || candidate_lower.contains("wish")
+                || candidate_lower.contains("pool")
+                || candidate_lower.contains("authkey");
+            if looks_like_history_source {
+                let kind = if candidate_lower.contains("authkey=") {
+                    "url_token"
+                } else {
+                    "possible_history_source"
+                };
                 findings.push(ScanFinding {
                     game_id: game_id.clone(),
                     source_file: log.display().to_string(),
-                    kind: "possible_history_source".to_string(),
+                    kind: kind.to_string(),
                     value: sanitize_url(&candidate),
                     raw_value: Some(candidate),
                 });

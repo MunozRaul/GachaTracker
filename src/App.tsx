@@ -17,6 +17,7 @@ const GAME_SETTINGS = [
 const GAME_LABELS = Object.fromEntries(
   GAME_SETTINGS.map((game) => [game.id, game.label]),
 ) as Record<string, string>;
+const GAME_IDS: string[] = GAME_SETTINGS.map((game) => game.id);
 
 const DEFAULT_SETTINGS: ScanSettings = {
   gamePaths: {},
@@ -125,10 +126,35 @@ function App() {
     [visibleRows],
   );
 
+  const newestFirstRows = useMemo(() => {
+    const rows = [...visibleRows];
+    if (rows.length > 1) {
+      const firstTs = Date.parse(rows[0].pulledAt ?? "");
+      const lastTs = Date.parse(rows[rows.length - 1].pulledAt ?? "");
+      if (!Number.isNaN(firstTs) && !Number.isNaN(lastTs) && firstTs < lastTs) {
+        rows.reverse();
+      }
+    }
+    return rows;
+  }, [visibleRows]);
+
+  const visibleScanNotes = useMemo(
+    () =>
+      lastScanNotes.filter((note) => {
+        const lowered = note.toLowerCase();
+        const mentionedGameIds = GAME_IDS.filter((gameId) =>
+          lowered.includes(gameId),
+        );
+        if (!mentionedGameIds.length) {
+          return true;
+        }
+        return mentionedGameIds.includes(selectedGameId);
+      }),
+    [lastScanNotes, selectedGameId],
+  );
+
   const fiveStarSummary = useMemo(() => {
-    // The imported pull stream is newest -> oldest. Reverse once so pity counts
-    // are computed from older pulls toward newer pulls.
-    const chronologicalRows = [...visibleRows].reverse();
+    const chronologicalRows = [...newestFirstRows].reverse();
 
     let pullsSinceLastFive = 0;
     const summary = [] as Array<{
@@ -152,7 +178,18 @@ function App() {
     }
 
     return summary.reverse();
-  }, [visibleRows]);
+  }, [newestFirstRows]);
+
+  const pullsSinceLatestFiveStar = useMemo(() => {
+    let pulls = 0;
+    for (const pull of newestFirstRows) {
+      if (pull.rarity === 5) {
+        return { pulls, hasRecentFiveStar: true };
+      }
+      pulls += 1;
+    }
+    return { pulls, hasRecentFiveStar: false };
+  }, [newestFirstRows]);
 
   const summaryChipClass = (pullsToFive: number) => {
     if (pullsToFive <= 40) {
@@ -296,9 +333,9 @@ function App() {
                 </button>
               </div>
 
-              {lastScanNotes.length ? (
+              {visibleScanNotes.length ? (
                 <ul className="scan-note-list">
-                  {lastScanNotes.map((note) => (
+                  {visibleScanNotes.map((note) => (
                     <li key={note} className="muted small-note">
                       {note}
                     </li>
@@ -364,6 +401,20 @@ function App() {
                 <p className="panel-kicker">
                   Pulls needed between consecutive 5★ entries
                 </p>
+              </div>
+              <div className="latest-five-star-stat">
+                <span className="muted">Pulls since latest 5★</span>
+                <strong>{pullsSinceLatestFiveStar.pulls}</strong>
+                <span
+                  className={`chip ${summaryChipClass(pullsSinceLatestFiveStar.pulls)}`}
+                >
+                  pity progress
+                </span>
+                {!pullsSinceLatestFiveStar.hasRecentFiveStar ? (
+                  <span className="muted small-note">
+                    No 5★ found in currently loaded history.
+                  </span>
+                ) : null}
               </div>
               {fiveStarSummary.length ? (
                 <div className="five-star-list">

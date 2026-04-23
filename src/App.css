@@ -384,6 +384,21 @@ button:disabled {
   background: rgba(12, 20, 43, 0.76);
 }
 
+.latest-five-star-stat {
+  border: 1px solid rgba(70, 92, 170, 0.65);
+  border-radius: 10px;
+  padding: 0.55rem 0.6rem;
+  margin-bottom: 0.7rem;
+  background: rgba(14, 24, 53, 0.72);
+  display: grid;
+  gap: 0.3rem;
+}
+
+.latest-five-star-stat strong {
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
 .five-star-list {
   display: grid;
   gap: 0.55rem;
