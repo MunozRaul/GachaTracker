@@ -217,7 +217,8 @@ const CONFIRMED_OFFICIAL_API_HOSTS: [&str; 8] = [
     "public-operation-nap.hoyoverse.com",
     "public-operation-nap-sg.hoyoverse.com",
 ];
-const DB_SCHEMA_VERSION: i64 = 5;
+const DB_SCHEMA_VERSION: i64 = 7;
+const MAX_PERSISTED_SCANS: i64 = 1;
 const WUWA_ROOT_DIR_HINTS: [&str; 4] = [
     "WutheringWaves",
     "Wuthering Waves",
@@ -317,6 +318,7 @@ async fn run_local_import(
         let mut conn = open_db(&db_path)?;
         persist_import_session(&mut conn, &import_session)?;
         recompute_import_summary(&conn, import_session.id)?;
+        prune_scan_history(&conn, MAX_PERSISTED_SCANS)?;
         let recomputed = load_import_session(&conn, import_session.id)?;
 
         Ok(RunLocalImportResponse {
@@ -550,7 +552,7 @@ fn get_latest_import_session(app: tauri::AppHandle) -> Result<Option<ImportSessi
     let conn = open_db(&db_path)?;
     let latest_id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM import_sessions ORDER BY id DESC LIMIT 1",
+            "SELECT scan_id FROM import_sessions ORDER BY scan_id DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -1031,6 +1033,14 @@ fn query_map_from_token_url(token_url: &str) -> Option<BTreeMap<String, String>>
     if out.is_empty() { None } else { Some(out) }
 }
 
+fn value_as_compact_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+}
+
 fn history_timeout_client() -> Result<Client, String> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(8))
@@ -1152,7 +1162,8 @@ fn fetch_wuwa_history_from_token(
             find_wuwa_items_array(&response_json).unwrap_or_default()
         };
 
-        for (entry_index, entry) in list.into_iter().enumerate() {
+        let mut signature_counts = BTreeMap::<String, usize>::new();
+        for entry in list {
             let item_name = entry
                 .get("name")
                 .or_else(|| entry.get("Name"))
@@ -1187,10 +1198,29 @@ fn fetch_wuwa_history_from_token(
                 .or_else(|| entry.get("RecordId"))
                 .or_else(|| entry.get("gachaId"))
                 .or_else(|| entry.get("GachaId"))
-                .map(Value::to_string)
+                .and_then(value_as_compact_string)
                 .unwrap_or_default();
-            let pull_id =
-                format!("ww:{card_pool_type}:{pulled_at}:{item_name}:{entry_index}:{record_hint}");
+            let resource_hint = entry
+                .get("resourceId")
+                .or_else(|| entry.get("ResourceId"))
+                .and_then(value_as_compact_string)
+                .unwrap_or_default();
+            let signature_seed = format!(
+                "{card_pool_type}|{pulled_at}|{item_name}|{item_type_name}|{rarity}|{resource_hint}|{record_hint}"
+            );
+            let occurrence = signature_counts
+                .entry(signature_seed)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+
+            let stable_hint = if !record_hint.is_empty() {
+                record_hint
+            } else if !resource_hint.is_empty() {
+                resource_hint
+            } else {
+                format!("{item_name}:{item_type_name}:{rarity}")
+            };
+            let pull_id = format!("ww:{card_pool_type}:{pulled_at}:{stable_hint}:{}", *occurrence);
 
             rows.push(HistoryPullRow {
                 game_id: "wuthering-waves".to_string(),
@@ -2684,6 +2714,67 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
             .map_err(|e| format!("Failed updating schema version to v5: {e}"))?;
     }
 
+    if current_version < 6 {
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS history_ledger_pulls (
+                dedupe_key TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL,
+                banner_id TEXT NOT NULL,
+                source_pull_id TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                item_name TEXT NULL,
+                item_type_name TEXT NULL,
+                rarity INTEGER NULL,
+                pulled_at TEXT NULL,
+                first_seen_scan_id INTEGER NOT NULL,
+                last_seen_scan_id INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_history_ledger_game_time
+            ON history_ledger_pulls (game_id, pulled_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_history_ledger_last_seen
+            ON history_ledger_pulls (last_seen_scan_id DESC);
+            ",
+        )
+        .map_err(|e| format!("Failed applying schema migration v6: {e}"))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![6i64, unix_ts() as i64],
+        )
+        .map_err(|e| format!("Failed recording migration v6: {e}"))?;
+
+        current_version = 6;
+        tx.pragma_update(None, "user_version", current_version)
+            .map_err(|e| format!("Failed updating schema version to v6: {e}"))?;
+    }
+
+    if current_version < 7 {
+        tx.execute_batch(
+            "
+            ALTER TABLE history_ledger_pulls ADD COLUMN first_seen_row_index INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE history_ledger_pulls ADD COLUMN last_seen_row_index INTEGER NOT NULL DEFAULT 0;
+            ",
+        )
+        .or_else(|_| Ok(()))
+        .map_err(|e: rusqlite::Error| format!("Failed applying schema migration v7: {e}"))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![7i64, unix_ts() as i64],
+        )
+        .map_err(|e| format!("Failed recording migration v7: {e}"))?;
+
+        current_version = 7;
+        tx.pragma_update(None, "user_version", current_version)
+            .map_err(|e| format!("Failed updating schema version to v7: {e}"))?;
+    }
+
     if current_version > DB_SCHEMA_VERSION {
         return Err(format!(
             "Database schema version {current_version} is newer than supported version {DB_SCHEMA_VERSION}."
@@ -2824,6 +2915,246 @@ fn persist_scan(
     Ok(scan_id)
 }
 
+fn history_ledger_dedupe_key(pull: &Pull) -> String {
+    let source_pull_id = pull.id.trim();
+    if !source_pull_id.is_empty() {
+        return format!("{}|id|{source_pull_id}", pull.game_id);
+    }
+
+    let item_name = pull
+        .item_name
+        .as_deref()
+        .unwrap_or(&pull.value)
+        .trim()
+        .to_ascii_lowercase();
+    let item_type_name = pull
+        .item_type_name
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let pulled_at = pull
+        .pulled_at
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let rarity = pull.rarity.unwrap_or(-1);
+    format!(
+        "{}|fp|{}|{}|{}|{}|{}|{}",
+        pull.game_id,
+        pull.banner_id,
+        pulled_at,
+        item_name,
+        item_type_name,
+        rarity,
+        pull.source_file
+    )
+}
+
+fn upsert_history_ledger_pull(
+    tx: &rusqlite::Transaction<'_>,
+    scan_id: i64,
+    row_index: i64,
+    pull: &Pull,
+) -> Result<(), String> {
+    let dedupe_key = history_ledger_dedupe_key(pull);
+    tx.execute(
+        "
+        INSERT INTO history_ledger_pulls (
+            dedupe_key,
+            game_id,
+            banner_id,
+            source_pull_id,
+            source_file,
+            source_type,
+            kind,
+            value,
+            item_name,
+            item_type_name,
+            rarity,
+            pulled_at,
+            first_seen_scan_id,
+            last_seen_scan_id,
+            first_seen_row_index,
+            last_seen_row_index
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        ON CONFLICT(dedupe_key)
+        DO UPDATE SET
+            game_id = excluded.game_id,
+            banner_id = excluded.banner_id,
+            source_pull_id = excluded.source_pull_id,
+            source_file = excluded.source_file,
+            source_type = excluded.source_type,
+            kind = excluded.kind,
+            value = excluded.value,
+            item_name = CASE
+                WHEN excluded.item_name IS NULL OR excluded.item_name = ''
+                    THEN history_ledger_pulls.item_name
+                ELSE excluded.item_name
+            END,
+            item_type_name = CASE
+                WHEN excluded.item_type_name IS NULL OR excluded.item_type_name = ''
+                    THEN history_ledger_pulls.item_type_name
+                ELSE excluded.item_type_name
+            END,
+            rarity = CASE
+                WHEN excluded.rarity IS NULL
+                    THEN history_ledger_pulls.rarity
+                ELSE excluded.rarity
+            END,
+            pulled_at = CASE
+                WHEN excluded.pulled_at IS NULL OR excluded.pulled_at = ''
+                    THEN history_ledger_pulls.pulled_at
+                ELSE excluded.pulled_at
+            END,
+            last_seen_scan_id = excluded.last_seen_scan_id,
+            last_seen_row_index = excluded.last_seen_row_index
+        ",
+        params![
+            &dedupe_key,
+            &pull.game_id,
+            &pull.banner_id,
+            pull.id.trim(),
+            &pull.source_file,
+            &pull.source_type,
+            &pull.kind,
+            &pull.value,
+            &pull.item_name,
+            &pull.item_type_name,
+            &pull.rarity,
+            &pull.pulled_at,
+            scan_id,
+            scan_id,
+            row_index,
+            row_index
+        ],
+    )
+    .map_err(|e| format!("Failed writing history ledger pull row: {e}"))?;
+
+    Ok(())
+}
+
+fn load_history_ledger_pulls(conn: &Connection) -> Result<Vec<Pull>, String> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT source_pull_id, game_id, banner_id, source_file, source_type, kind, value, item_name, item_type_name, rarity, pulled_at, dedupe_key
+            FROM history_ledger_pulls
+            ORDER BY
+                CASE WHEN pulled_at IS NULL OR pulled_at = '' THEN 1 ELSE 0 END ASC,
+                pulled_at DESC,
+                last_seen_scan_id DESC,
+                last_seen_row_index ASC,
+                dedupe_key DESC
+            ",
+        )
+        .map_err(|e| format!("Failed preparing history ledger query: {e}"))?;
+
+    let iter = stmt
+        .query_map([], |row| {
+            let source_pull_id: String = row.get(0)?;
+            let dedupe_key: String = row.get(11)?;
+            let id = if source_pull_id.trim().is_empty() {
+                dedupe_key
+            } else {
+                source_pull_id
+            };
+            Ok(Pull {
+                id,
+                game_id: row.get(1)?,
+                banner_id: row.get(2)?,
+                source_file: row.get(3)?,
+                source_type: row.get(4)?,
+                kind: row.get(5)?,
+                value: row.get(6)?,
+                item_name: row.get(7)?,
+                item_type_name: row.get(8)?,
+                rarity: row.get(9)?,
+                pulled_at: row.get(10)?,
+            })
+        })
+        .map_err(|e| format!("Failed querying history ledger pulls: {e}"))?;
+
+    let mut pulls = Vec::<Pull>::new();
+    for row in iter {
+        pulls.push(row.map_err(|e| format!("Failed reading history ledger pull row: {e}"))?);
+    }
+    Ok(pulls)
+}
+
+fn merge_scan_pulls_with_history_ledger(scan_pulls: Vec<Pull>, ledger_pulls: Vec<Pull>) -> Vec<Pull> {
+    let mut merged = scan_pulls;
+
+    let mut seen_history_keys = HashSet::<String>::new();
+    let mut oldest_scan_history_time = None::<String>;
+    for pull in merged.iter().filter(|pull| pull.kind == "history_pull") {
+        seen_history_keys.insert(history_ledger_dedupe_key(pull));
+        if let Some(ts) = pull
+            .pulled_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|ts| !ts.is_empty())
+        {
+            match oldest_scan_history_time.as_ref() {
+                Some(oldest) if ts >= oldest.as_str() => {}
+                _ => oldest_scan_history_time = Some(ts.to_string()),
+            }
+        }
+    }
+
+    let has_scan_history = !seen_history_keys.is_empty();
+    let mut ledger_history_candidates = Vec::<Pull>::new();
+    for pull in ledger_pulls.into_iter().filter(|pull| pull.kind == "history_pull") {
+        let dedupe_key = history_ledger_dedupe_key(&pull);
+        if seen_history_keys.contains(&dedupe_key) {
+            continue;
+        }
+
+        if has_scan_history {
+            if let (Some(oldest_ts), Some(pull_ts)) = (
+                oldest_scan_history_time.as_ref(),
+                pull.pulled_at
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|ts| !ts.is_empty()),
+            ) {
+                if pull_ts >= oldest_ts.as_str() {
+                    continue;
+                }
+            }
+        }
+
+        seen_history_keys.insert(dedupe_key);
+        ledger_history_candidates.push(pull);
+    }
+
+    merged.extend(ledger_history_candidates);
+    merged
+}
+
+fn ensure_banners_cover_history_pulls(banners: &mut Vec<Banner>, pulls: &[Pull]) {
+    let mut existing_banner_ids = banners
+        .iter()
+        .map(|banner| banner.id.clone())
+        .collect::<HashSet<_>>();
+
+    for pull in pulls.iter().filter(|pull| pull.kind == "history_pull") {
+        if !existing_banner_ids.insert(pull.banner_id.clone()) {
+            continue;
+        }
+        banners.push(Banner {
+            id: pull.banner_id.clone(),
+            game_id: pull.game_id.clone(),
+            name: banner_name_from_banner_id(&pull.game_id, &pull.banner_id),
+            pull_type: "history-pull".to_string(),
+        });
+    }
+
+    banners.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
 fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Result<(), String> {
     let tx = conn
         .transaction()
@@ -2896,6 +3227,10 @@ fn persist_import_session(conn: &mut Connection, session: &ImportSession) -> Res
     let mut seen_pull_ids = HashSet::<String>::new();
     for (row_index, pull) in session.pulls.iter().enumerate() {
         if !seen_pull_ids.insert(pull.id.clone()) {
+            continue;
+        }
+        if pull.kind == "history_pull" {
+            upsert_history_ledger_pull(&tx, session.id, row_index as i64, pull)?;
             continue;
         }
         tx.execute(
@@ -3034,6 +3369,28 @@ fn recompute_import_summary(conn: &Connection, scan_id: i64) -> Result<(), Strin
     Ok(())
 }
 
+fn prune_scan_history(conn: &Connection, max_scans: i64) -> Result<(), String> {
+    if max_scans < 1 {
+        return Ok(());
+    }
+
+    conn.execute(
+        "
+        DELETE FROM scans
+        WHERE id NOT IN (
+            SELECT id
+            FROM scans
+            ORDER BY id DESC
+            LIMIT ?1
+        )
+        ",
+        params![max_scans],
+    )
+    .map_err(|e| format!("Failed pruning old scans: {e}"))?;
+
+    Ok(())
+}
+
 fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession, String> {
     let (scanned_at, root_path, strict_offline, allow_official_api_exceptions): (
         String,
@@ -3106,10 +3463,13 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
             })
         })
         .map_err(|e| format!("Failed querying import pulls: {e}"))?;
-    let mut pulls = Vec::<Pull>::new();
+    let mut scan_pulls = Vec::<Pull>::new();
     for row in pulls_iter {
-        pulls.push(row.map_err(|e| format!("Failed reading import pull row: {e}"))?);
+        scan_pulls.push(row.map_err(|e| format!("Failed reading import pull row: {e}"))?);
     }
+
+    let history_ledger_pulls = load_history_ledger_pulls(conn)?;
+    let pulls = merge_scan_pulls_with_history_ledger(scan_pulls, history_ledger_pulls);
 
     let mut banners_stmt = conn
         .prepare(
@@ -3135,6 +3495,7 @@ fn load_import_session(conn: &Connection, scan_id: i64) -> Result<ImportSession,
     for row in banners_iter {
         banners.push(row.map_err(|e| format!("Failed reading import banner row: {e}"))?);
     }
+    ensure_banners_cover_history_pulls(&mut banners, &pulls);
 
     let mut sources_stmt = conn
         .prepare(

@@ -34,6 +34,14 @@ function isWeaponBanner(name: string) {
   return WEAPON_BANNER_KEYWORDS.some((keyword) => normalized.includes(keyword));
 }
 
+function isWuwaFeaturedResonatorBanner(bannerId: string) {
+  return bannerId === "wuthering-waves:1";
+}
+
+function isWuwaFeaturedWeaponBanner(bannerId: string) {
+  return bannerId === "wuthering-waves:2";
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<ViewTab>("games");
   const [selectedGameId, setSelectedGameId] = useState<string>(GAME_SETTINGS[0].id);
@@ -84,6 +92,9 @@ function App() {
   const resonatorRows = useMemo(
     () =>
       actualGamePulls.filter((pull) => {
+        if (pull.gameId === "wuthering-waves") {
+          return isWuwaFeaturedResonatorBanner(pull.bannerId);
+        }
         const bannerName = bannerNameById.get(pull.bannerId) ?? pull.bannerId;
         return !isWeaponBanner(bannerName);
       }),
@@ -93,6 +104,9 @@ function App() {
   const weaponRows = useMemo(
     () =>
       actualGamePulls.filter((pull) => {
+        if (pull.gameId === "wuthering-waves") {
+          return isWuwaFeaturedWeaponBanner(pull.bannerId);
+        }
         const bannerName = bannerNameById.get(pull.bannerId) ?? pull.bannerId;
         return isWeaponBanner(bannerName);
       }),
