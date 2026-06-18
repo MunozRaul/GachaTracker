@@ -8,6 +8,16 @@ Offline-first local desktop gacha tracker for:
 
 The app scans local logs/cache files, extracts URL tokens, fetches pull history from official endpoints (when enabled), and persists everything into a local SQLite database.
 
+## Product vision
+
+GachaTracker should be a modular desktop platform where each game is implemented as a reusable adapter, while the app keeps one consistent user experience for history import, pity tracking, and analytics.
+
+Core direction:
+- Add new games by plugging in a scanner/parser/fetch adapter without rewriting the UI or storage core.
+- Normalize similar gacha concepts (banners, pulls, rarity, pity counters, sources) into shared models so cross-game features can be reused.
+- Keep game-specific logic isolated (endpoints, log formats, auth/token extraction, banner mapping) to reduce regression risk.
+- Preserve an offline-first local history ledger so users can keep long-term data even when official API windows expire.
+
 ## Current project status
 
 - Wuthering Waves flow is the primary stable path.
